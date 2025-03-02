@@ -13,100 +13,233 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from pyspark.sql.functions import col
 from pyspark.sql.functions import to_timestamp
+import tqdm
+
+def test_actions_sasrec(df_final, df_original, action):
+  test_actions_structure(df_final)
+  test_missing_values(df_final)
+  test_number_users(df_final, df_original, action)
+  test_users_actions(df_final, df_original, action)
+
+from pyspark.sql.types import IntegerType, TimestampType, DoubleType
 
 def test_actions_structure(df):
     # Проверка названий колонок
     expected_columns = {"user_id", "item_id", "datetime", "weight"}
-    assert set(df.columns) == expected_columns, f"Ошибка: Ожидались колонки {expected_columns}, но получены {set(df.columns)}"
+    actual_columns = set(df.columns)
+    assert actual_columns == expected_columns, f"Ошибка: Ожидались колонки {expected_columns}, но получены {actual_columns}"
+
+    # Получаем схему DataFrame
+    schema = dict(df.dtypes)
 
     # Проверка типов данных
-    assert pd.api.types.is_integer_dtype(df["user_id"]), "Ошибка: 'user_id' должен быть целым числом"
-    assert pd.api.types.is_integer_dtype(df["item_id"]), "Ошибка: 'item_id' должен быть целым числом"
-    assert pd.api.types.is_datetime64_any_dtype(df["datetime"]), "Ошибка: 'datetime' должен быть datetime"
-    assert pd.api.types.is_numeric_dtype(df["weight"]), "Ошибка: 'weight' должен быть числом"
+    assert schema["user_id"] == "int", "Ошибка: 'user_id' должен быть целым числом"
+    assert schema["item_id"] == "int", "Ошибка: 'item_id' должен быть целым числом"
+    assert schema["datetime"] == "timestamp", "Ошибка: 'datetime' должен быть datetime"
+    assert schema["weight"] == 'int', "Ошибка: 'weight' должен быть числом"
 
-    print("✅ Тест структуры данных пройден")
+    print("✅ В датасете правильные колонки и у них правильные типы данных")
+
+
+from pyspark.sql.functions import col, sum as spark_sum
 
 def test_missing_values(df):
-    missing_values = df.isnull().sum()
-    assert missing_values.sum() == 0, f"Ошибка: Найдены пропущенные значения\n{missing_values}"
+    # Считаем количество пропущенных значений в каждом столбце
+    missing_values = df.select([spark_sum(col(c).isNull().cast("int")).alias(c) for c in df.columns])
 
-    print("✅ Тест на пропущенные значения пройден")
+    # Преобразуем результат в словарь
+    missing_dict = missing_values.collect()[0].asDict()
 
+    # Проверяем, есть ли пропущенные значения
+    total_missing = sum(missing_dict.values())
+    assert total_missing == 0, f"Ошибка: Найдены пропущенные значения\n{missing_dict}"
 
-def test_number_users(df_final, df_original):
-  n_users_original = df_original.filter(df_original['action']=='conversion').select('customer_user_id').dropna().distinct().count()
-  n_users_final = len(df_final.user_id.unique())
-
-  assert n_users_final <= n_users_original, 'Ошибка: слишком большое число юзеров'
-  assert n_users_final > 0.95*n_users_original, 'Ошибка: пропало больше 5% нужных юзеров'
-
-  print("✅ Тест на множество юзеров пройден")
+    print("✅ В датасете нет пропущенных значений")
 
 
-def test_users_actions(df_final, df_original, n_users=3):
-  users = df_final['user_id'].sample(n=n_users)
-  for user in users:
-    test_user_actions(user, df_final, df_original)
 
-  print("✅ Тест на добавления в корзину пройден ")
+from pyspark.sql.functions import col
+
+def test_number_users(df_final, df_original, action):
+    # Считаем количество уникальных пользователей в оригинальном DataFrame
+    n_users_original = (df_original
+                        .filter(col('action') == action)
+                        .select('customer_user_id')
+                        .na.drop()
+                        .distinct()
+                        .count())
+
+    # Считаем количество уникальных пользователей в финальном DataFrame
+    n_users_final = df_final.select('user_id').distinct().count()
+
+    # Проверки
+    assert n_users_final <= n_users_original, 'Ошибка: слишком большое число юзеров'
+    assert n_users_final > 0.95 * n_users_original, 'Ошибка: пропало больше 5% нужных юзеров'
+
+    print("✅ В датасете правильное число юзеров, которые сделали действие")
 
 
-def test_user_actions(user_id, df_final, df_original):
-  assert  get_user_items_from_final(user_id, df_final) == get_user_items_from_original(user_id, df_original), f"Ошибка: неправильно указаны добавления в корзину для юзера {user_id}"
 
+from pyspark.sql.functions import col
+import random
+
+def test_users_actions(df_final, df_original, action, n_users=10):
+    # Выбираем случайных пользователей
+    users = df_final.select("user_id").distinct().rdd.flatMap(lambda x: x).takeSample(False, n_users)
+
+    for user in users:
+        test_user_actions(user, df_final, df_original, action)
+
+    print("✅ Для всех юзеров правильно указаны товары и время действий")
+
+def test_user_actions(user_id, df_final, df_original, action):
+    assert get_user_items_from_final(user_id, df_final) == get_user_items_from_original(user_id, df_original, action), \
+        f"Ошибка: неправильно указаны набор товаров и время действий для юзера {user_id}"
 
 def get_user_items_from_final(user_id, df):
-    df = df[df["user_id"] == user_id][["item_id", "datetime"]]
-    df['datetime'] = pd.to_datetime(df['datetime'], format='%Y-%m-%d %H:%M:%S')
-    return set(zip(df['item_id'], df['datetime']))
+    df_filtered = df.filter(col("user_id") == user_id).select("item_id", "datetime")
 
-def get_user_items_from_original(user_id, df):
-    df = df.filter(df['action']=='conversion').filter(df['customer_user_id']==str(user_id)).select("customer_id", "timestamp").toPandas().dropna()
-    df['timestamp'] = pd.to_datetime(df['timestamp'], format='%Y-%m-%d %H:%M:%S').apply(lambda x: x.replace(microsecond=0))
-    df['customer_id'] = df['customer_id'].apply(lambda x: int(x))
-    result = set(zip(df['customer_id'], df['timestamp']))
+    # Собираем в сет кортежей (item_id, datetime)
+    result = set(df_filtered.rdd.map(lambda row: (row["item_id"], row["datetime"])).collect())
 
     return result
 
-def test_actions_petco(df_final, df_original):
-  test_actions_structure(df_final)
+from pyspark.sql.functions import col, to_timestamp
+from pyspark.sql.types import TimestampType
+from datetime import datetime
+
+def get_user_items_from_original(user_id, df, action):
+    df_filtered = (df.filter(col("action") == action)
+                     .filter(col("customer_user_id") == str(user_id))
+                     .select("customer_id", "timestamp"))
+
+    # Преобразуем в тип Timestamp
+    df_filtered = df_filtered.withColumn(
+        "timestamp", to_timestamp(col("timestamp"))
+    )
+
+    # Преобразуем в set кортежей (customer_id, timestamp), убираем микросекунды
+    result = set(df_filtered.rdd.map(lambda row: (int(row["customer_id"]), row["timestamp"].replace(microsecond=0))).collect())
+
+    return result
+
+def test_items_sasrec(df_final, df_original, metadata_original_names, facets_original_names, features_final_names):
+  test_items_structure(df_final)
   test_missing_values(df_final)
-  test_users_actions(df_final, df_original)
+  test_number_items(df_final, df_original)
+  test_items_features(df_final, df_original, metadata_original_names, facets_original_names, features_final_names)
+
+from pyspark.sql.functions import col
+from tqdm import tqdm
 
 def test_items_structure(df):
     # Проверка названий колонок
     expected_columns = {"id", "value", "feature"}
-    assert set(df.columns) == expected_columns, f"Ошибка: Ожидались колонки {expected_columns}, но получены {set(df.columns)}"
+    actual_columns = set(df.columns)
+    assert actual_columns == expected_columns, f"Ошибка: Ожидались колонки {expected_columns}, но получены {actual_columns}"
 
     # Проверка типов данных
-    assert pd.api.types.is_integer_dtype(df["id"]), "Ошибка: 'id' должен быть целым числом"
-    assert pd.api.types.is_string_dtype(df["value"]), "Ошибка: 'value' должен быть строкой"
-    assert pd.api.types.is_string_dtype(df["feature"]), "Ошибка: 'feature' должен быть строкой"
+    schema = df.schema
+    assert schema["id"].dataType.simpleString() == "int", "Ошибка: 'id' должен быть целым числом"
+    assert schema["value"].dataType.simpleString() == "string", "Ошибка: 'value' должен быть строкой"
+    assert schema["feature"].dataType.simpleString() == "string", "Ошибка: 'feature' должен быть строкой"
 
-    print("✅ Тест структуры данных пройден")
+    print("✅ В датасете правильные колонки и у них правильные типы данных")
+
+from pyspark.sql.functions import col, sum as spark_sum
 
 def test_missing_values(df):
-    missing_values = df.isnull().sum()
-    assert missing_values.sum() == 0, f"Ошибка: Найдены пропущенные значения\n{missing_values}"
+    # Считаем количество пропущенных значений в каждом столбце
+    missing_values = df.select([spark_sum(col(c).isNull().cast("int")).alias(c) for c in df.columns])
 
-    print("✅ Тест на пропущенные значения пройден")
+    # Преобразуем результат в словарь
+    missing_dict = missing_values.collect()[0].asDict()
+
+    # Проверяем, есть ли пропущенные значения
+    total_missing = sum(missing_dict.values())
+    assert total_missing == 0, f"Ошибка: Найдены пропущенные значения\n{missing_dict}"
+
+    print("✅ В датасете нет пропущенных значений")
+
 
 
 def test_number_items(df_final, df_original):
-  n_items_original = df_original.select('customer_id').dropna().distinct().count()
-  n_items_final = len(df_final['id'].unique())
+    n_items_original = df_original.select("customer_id").distinct().count()
+    n_items_final = df_final.select("id").dropna().distinct().count()
 
-  assert n_items_final == n_items_original, 'Ошибка: число юзеров не совпадает с каталогом'
+    assert n_items_final == n_items_original, "Ошибка: число товаров не совпадает с каталогом"
 
-  print("✅ Тест на множество товаров пройден")
+    print("✅ Тест на множество товаров пройден")
 
 
-def test_items_features(df_final, df_original, n_users=3):
+def test_items_features(df_final, df_original, metadata_original_names, facets_original_names, features_final_names, n_items=10):
+    # Выбираем случайных пользователей
+    items = df_final.select("id").distinct().rdd.flatMap(lambda x: x).takeSample(False, n_items)
 
-  print("✅ Тест на признаки товаров пройден ")
+    for item in tqdm(items):
+        test_item_features(item, df_final, df_original, metadata_original_names, facets_original_names, features_final_names)
 
-def test_items_petco(df_final, df_original):
-  test_items_structure(df_final)
-  test_missing_values(df_final)
-  test_number_items(df_final, df_original)
+    print("\n✅ Признаки товаров в датасете совпадают с каталогом")
+
+
+def test_item_features(item_id, df_final, df_original, metadata, facets, features_final_names):
+  features_original_names = metadata + facets
+  features_names_changes = {features_original_names[i] : features_final_names[i] for i in range(len(features_original_names))}
+
+  item_features_final = item_features_from_final(item_id, df_final)
+  item_features_original = {features_names_changes[key] : value for key, value in item_features_from_original(item_id, df_original, metadata, facets).items()}
+  assert set(item_features_final).issubset(item_features_original), 'Ошибка: Финальный набор категорий содержит лишнюю категорию'
+  assert len(item_features_final) > 0, f'Ошибка: У товара {item_id} нет никаких признаков'
+
+
+import json
+
+def item_features_from_original(item_id, df, metadata, facets=None):
+  features_out = {}
+  df = df.filter(col('customer_id')==item_id).select('metadata_json')
+  metadata_in = json.loads(df.first()[0])
+  for metadata_type in metadata:
+    features_out[metadata_type] = metadata_in[metadata_type]
+
+  if facets:
+    facets_in = metadata_in['facets']
+    for facet in facets:
+      if facet in facets_in.keys():
+        features_out[facet] = facets_in[facet]
+  return features_out
+
+
+from pyspark.sql.functions import collect_set
+def item_features_from_final(item_id, dataset):
+    """
+    Функция принимает item_id и PySpark DataFrame, а возвращает словарь,
+    где ключи — это уникальные значения из столбца feature,
+    а значения — списки уникальных значений из столбца value для данного item_id.
+    """
+    # Фильтруем датасет по item_id
+    filtered_data = dataset.filter(dataset.id == item_id)
+
+    # Группируем по feature и собираем уникальные значения value
+    result = (
+        filtered_data
+        .groupBy("feature")
+        .agg(collect_set("value").alias("values"))
+        .rdd
+        .map(lambda row: (row["feature"], row["values"]))
+        .collectAsMap()
+    )
+
+    return result
+
+def common_tests_sasrec(df_actions, df_items):
+  test_conversed_items_in_catalog(df_actions, df_items)
+
+def test_conversed_items_in_catalog(df_actions, df_items):
+  all_items_from_actions = set(df_actions.select("item_id").distinct().rdd.map(lambda row: row["item_id"]).collect())
+  all_items_from_catalog = set(df_items.select("id").distinct().rdd.map(lambda row: row["id"]).collect())
+
+  print(len(all_items_from_actions), len(all_items_from_catalog))
+  assert len(all_items_from_actions) <= len(all_items_from_catalog), 'Ошибка: В финальном датасете товаров слишком мало товаров'
+  assert len(all_items_from_actions - all_items_from_catalog) < 0.001*len(all_items_from_actions), 'Ошибка: О многих товарах нет информации в финальном датасете товаров'
+
+  print("✅ В финальном датасете товаров есть 99.9% всех необходимых товаров")

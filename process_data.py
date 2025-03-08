@@ -7,225 +7,319 @@ Original file is located at
     https://colab.research.google.com/drive/1EM7-n_vd2V6fDQIC5ryy9qrMkgWlNSQX
 """
 
-from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-import matplotlib.pyplot as plt
-import os
-from pyspark.sql.functions import from_json, col
+from pyspark.sql import SparkSession, functions as F, DataFrame, Column, Row
 from pyspark.sql.types import StructType, StructField, StringType, ArrayType, BooleanType
-from pyspark.sql.functions import collect_list, udf
-from pyspark.sql.types import ArrayType, StringType
-from pyspark.sql.functions import first
-import pandas as pd
+from pyspark.sql.functions import col, from_json, collect_list, udf, first
+import os
+import json
+import pyspark
+from typing import List, Dict, Tuple, Set, Optional, Callable
 
 """# Сначала подготовим датасет с последовательностями конверсий"""
 
-def clean_petco_conversions(data_logs):
-  data_conversions = data_logs.filter(data_logs.action == 'conversion')
+def clean_data_actions(data_logs: pyspark.sql.DataFrame, action: str) -> pyspark.sql.DataFrame:
+    """
+    Обрабатывает датасет, фильтруя его по нужному действию и оставляя только потенциально полезные для него колонки.
 
-  # Оставляем только нужные столбцы
-  data_conversions_filtered = data_conversions.select('customer_user_id', 'customer_id', 'timestamp', 'revenue')
+    Args:
+        data_logs (pyspark.sql.DataFrame): Входной датасет с логами действий пользователей (needed_beh_logs.parquet). Должен содержать столбцы:
+            - action: Действие пользователя (например, 'conversion').
+            - customer_user_id: Уникальный идентификатор пользователя.
+            - customer_id: Уникальный идентификатор товара.
+            - timestamp: Временная метка действия.
+            - revenue: Доход, полученный от действия.
+        action (str): Названия действия для фильтрации датасета
 
-  # Добавляем новый столбец 'conversion' со значением 1
-  data_conversions_filtered = data_conversions_filtered.withColumn('conversion', F.lit(1))
+    Returns:
+        pyspark.sql.DataFrame: Очищенный датасет со следующими столбцами:
+            - user_id: Уникальный идентификатор пользователя.
+            - item_id: Уникальный идентификатор товара или услуги.
+            - timestamp: Временная метка конверсии.
+            - revenue: Доход, полученный от конверсии.
+    """
+    # Фильтруем данные, оставляя только строки с действием 'conversion'
+    data_actions = data_logs.filter(data_logs.action == action)
 
-  # Переставляем столбцы, чтобы 'conversion' был на третьем месте
-  data_conversions_filtered = data_conversions_filtered.select(
-      'customer_user_id', 'customer_id', 'conversion', 'timestamp', 'revenue'
-  )
+    # Оставляем только нужные столбцы: customer_user_id, customer_id, timestamp, revenue
+    data_actions_filtered = data_actions.select('customer_user_id', 'customer_id', 'timestamp', 'revenue')
 
-  data_conversions = data_conversions_filtered.orderBy(['customer_user_id', 'timestamp'])
-  data_conversions = data_conversions.withColumnRenamed('customer_user_id', 'user_id') \
-                    .withColumnRenamed('customer_id', 'item_id')
+    # Сортируем данные по customer_user_id и timestamp
+    data_actions = data_actions_filtered.orderBy(['customer_user_id', 'timestamp'])
 
-  return data_conversions.dropna()
+    # Переименовываем столбцы для удобства
+    data_actions = data_actions.withColumnRenamed('customer_user_id', 'user_id') \
+                      .withColumnRenamed('customer_id', 'item_id')
 
-def save_dataset_parquet(dataset, folder_path, file_name):
-  # Проверяем, существует ли папка, если нет - создаем
-  if not os.path.exists(folder_path):
-      os.makedirs(folder_path)
-      print(f"Папка {folder_path} успешно создана!")
-  else:
-      print(f"Папка {folder_path} уже существует.")
+    # Проверяем датасет на пропущенные значения
+    # check_nan_values(data_actions)
 
-  file_path = folder_path+file_name
+    return data_actions
 
-  # Сохранение в формате Parquet
-  dataset.write.parquet(file_path, mode="overwrite")
-  print(f"Датасет сохранён по пути {file_path}.")
 
-def actions_to_sasrec_format(data_conversions_cleaned):
-  data_conversions_processed = data_conversions_cleaned.withColumn(
-      "datetime", F.date_format("timestamp", "yyyy-MM-dd HH:mm:ss")  # Преобразуем timestamp в строку с датой и временем
-  ).withColumn(
-      "weight", F.lit(1)  # Добавляем колонку weight со значением 1
-  ).select("user_id", "item_id", "datetime", "weight")  # Оставляем нужные колонки
+def check_nan_values(data: pyspark.sql.DataFrame) -> int:
+    """
+    Проверяет пропущенные значения (NULL и NaN) в датасете.
 
-  data_conversions_processed = data_conversions_processed \
-    .withColumn("user_id", col("user_id").cast("int")) \
-    .withColumn("item_id", col("item_id").cast("int")) \
-    .withColumn("datetime", col("datetime").cast("timestamp")) \
-    .withColumn("weight", col("weight").cast("int"))
+    Args:
+        data (pyspark.sql.DataFrame): Входной датасет.
 
-  print(data_conversions_processed.dtypes)
+    Returns:
+        int: число строчек с NULL
+    """
+    # Подсчёт строк до удаления пропущенных значений
+    initial_count = data.count()
 
-  data_conversions_processed = data_conversions_processed.toPandas().dropna()
-  data_conversions_processed['user_id'] = data_conversions_processed['user_id'].apply(lambda x: int(x))
+    # Удаляем строки с пропущенными значениями
+    data_cleaned = data.dropna()
 
-  return data_conversions_processed
+    # Подсчёт строк после удаления пропущенных значений
+    final_count = data_cleaned.count()
 
-def save_dataset_pickle(dataset, folder_path, file_name):
-  # Проверяем, существует ли папка, если нет - создаем
-  if not os.path.exists(folder_path):
-      os.makedirs(folder_path)
-      print(f"Папка {folder_path} успешно создана!")
-  else:
-      print(f"Папка {folder_path} уже существует.")
+    # Вычисляем количество удалённых строк
+    removed_count = initial_count - final_count
+    print(f"Найдено строк c пропущенными значений: {removed_count}")
 
-  file_path = folder_path+file_name
+    # Проверяем, в каких колонках есть пропущенные значения
+    for column in data.columns:
+        # Получаем тип колонки
+        column_type = str(data.schema[column].dataType)
 
-  # Сохранение в формате Parquet
-  dataset.to_pickle(file_path)
-  print(f"Датасет сохранён по пути {file_path}.")
+        # Проверяем только NULL для нечисловых колонок
+        if column_type not in ["DoubleType", "FloatType"]:
+            na_count = data.filter(col(column).isNull()).count()
+            if na_count > 0:
+                print(f"Колонка '{column}' содержит {na_count} пропущенных значений (NULL).")
+        else:
+            # Для числовых колонок проверяем и NULL, и NaN
+            na_count = data.filter(col(column).isNull() | col(column).isNaN).count()
+            if na_count > 0:
+                print(f"Колонка '{column}' содержит {na_count} пропущенных значений (NULL или NaN).")
+
+    return removed_count
+
+def actions_to_sasrec_format(data_actions_cleaned: pyspark.sql.DataFrame) -> pyspark.sql.DataFrame:
+    """
+    Преобразует датасет с действиями юзеров в формат, подходящий для модели SASRec.
+    А именно указывает соотвествующий тип данных в датасете и отбрасывает не нужные столбцы
+
+    Args:
+        data_actions_cleaned (pyspark.sql.DataFrame): Датасет (полученный функцией clean_data_actions от изначального датасета needed_beh_logs)
+        только с нужными действиями покупателей. Должен содержать столбцы:
+            - user_id: Уникальный идентификатор пользователя.
+            - item_id: Уникальный идентификатор товара или услуги.
+            - timestamp: Временная метка действия.
+
+    Returns:
+        pyspark.sql.DataFrame: Преобразованный датасет со следующими столбцами:
+            - user_id: Уникальный идентификатор пользователя (тип bigint).
+            - item_id: Уникальный идентификатор товара или услуги (тип int).
+            - datetime: Временная метка действия в формате timestamp.
+            - weight: Вес действия (всегда 1, тип int).
+    """
+    # Преобразуем timestamp в строку с датой и временем и добавляем колонку weight
+    data_actions_processed = data_actions_cleaned.withColumn(
+        "datetime", F.date_format("timestamp", "yyyy-MM-dd HH:mm:ss")  # Преобразуем timestamp в строку
+    ).withColumn(
+        "weight", F.lit(1)  # Добавляем колонку weight со значением 1
+    ).select("user_id", "item_id", "datetime", "weight")  # Оставляем нужные колонки
+
+    # Приводим типы данных к нужным форматам
+    data_actions_processed = data_actions_processed \
+        .withColumn("user_id", col("user_id").cast("bigint")) \
+        .withColumn("item_id", col("item_id").cast("int")) \
+        .withColumn("datetime", col("datetime").cast("timestamp")) \
+        .withColumn("weight", col("weight").cast("int"))
+
+    # Проверяем датасет на пропущенные значения
+    # check_nan_values(data_actions_processed)
+
+    return data_actions_processed
 
 """# Теперь подготовим датасет с описанием товаров"""
 
-def clean_petco_items(data_items):
-  # Оставляем только столбцы id, customer_id, name, name_lower, metadata_json
-  data_items_filtered = data_items.select("id", "customer_id", "name", "name_lower", "metadata_json")
+def print_metadata(df: pyspark.sql.DataFrame):
+    """Выводит основные метаданные и отдельные значения facets из JSON в колонке metadata_json."""
+    first_row = df.select("metadata_json").first()
+    if not first_row:
+        print("Датасет пуст.")
+        return
 
-  # Определим структуру для metadata_json
-  metadata_schema = create_sctructure_metadata()
+    metadata = json.loads(first_row["metadata_json"])
 
-  # Преобразуем metadata_json в структуру
-  data_items_parsed = data_items_filtered.withColumn(
-      "metadata_parsed", from_json(col("metadata_json"), metadata_schema)
-  )
+    # Выводим основные метаданные
+    print("Основные метаданные:")
+    for key, value in metadata.items():
+        if key != "facets":
+            print(f"{key}: {value}")
 
-  # Извлекаем нужные атрибуты из metadata_parsed в отдельные столбцы
-  data_items_with_columns = data_items_parsed.select(
-      "id", "customer_id", "name", "name_lower",
-      "metadata_parsed.url", "metadata_parsed.image_url", "metadata_parsed.itemname",
-      "metadata_parsed.facets", "metadata_parsed.group_ids",
-      "metadata_parsed.PTC_OMNI_REPEAT_DELIVERY_FL", "metadata_parsed.PTC_OMNI_PRIMARY_ITEM_FLAG",
-      "metadata_parsed.PTC_OMNI_TAXONOMY", "metadata_parsed.PTC_OMNI_PERSONALIZED_ITEM_FL",
-      "metadata_parsed.PTC_OMNI_SAME_DAY_DELIVERY_FG", "metadata_parsed.PTC_OMNI_PDP_BEHAVIOR_TEMPLATE",
-      "metadata_parsed.PTC_OMNI_BOPUS_FLAG", "metadata_parsed.PTC_OMNI_BRAND_PRIMARY",
-      "metadata_parsed.itemurl", "metadata_parsed.itemimg", "metadata_parsed.UPC_NUMBER"
-  )
+    # Обрабатываем ключ facets отдельно
+    if "facets" in metadata:
+        print("\nFacets:")
+        facets = json.loads(metadata["facets"]) if isinstance(metadata["facets"], str) else metadata["facets"]
+        for key, value in facets.items():
+            print(f"{key}: {value}")
 
-  same_columns = ['name', 'name_lower', 'url', 'image_url', 'itemname', 'facets']
+def parse_metadata_json(data_items: pyspark.sql.DataFrame, metadata: List[str], facets: Optional[List[str]] = None) -> pyspark.sql.DataFrame:
+    """Извлекает данные из metadata_json и добавляет их как отдельные колонки."""
+    metadata_schema_fields = [
+        StructField(field, ArrayType(StringType()), True) if field == "group_ids" else StructField(field, StringType(), True)
+        for field in metadata
+    ]
 
-  # Регистрируем UDF для вычисления пересечения
-  intersection_udf = udf(array_intersection, ArrayType(StringType()))
+    if facets:
+        metadata_schema_fields.append(
+            StructField("facets", StructType([StructField(facet, ArrayType(StringType()), True) for facet in facets]), True)
+        )
 
-  # Группируем по customer_id и собираем все group_ids в список списков, затем вычисляем пересечение
-  data_items_intersect = data_items_with_columns.groupBy("customer_id") \
-      .agg(collect_list("group_ids").alias("group_ids_list")) \
-      .withColumn("group_ids_intersect", intersection_udf("group_ids_list"))
+    metadata_schema = StructType(metadata_schema_fields)
 
-  # Агрегируем data_items_with_columns по customer_id:
-  # Для каждого столбца из same_columns (кроме customer_id) берем первое значение
-  aggregated_same = data_items_with_columns.groupBy("customer_id").agg(
-      *[first(col_name).alias(col_name) for col_name in same_columns if col_name != "customer_id"]
-  )
+    data_items_parsed = data_items.withColumn(
+        "metadata_parsed", F.from_json(F.col("metadata_json"), metadata_schema)
+    )
 
-  # Теперь объединяем агрегированный DataFrame с DataFrame, содержащим group_ids_intersect.
-  # Предполагается, что data_items_intersect был получен ранее, например:
-  final_df = aggregated_same.join(
-      data_items_intersect.select("customer_id", "group_ids_intersect"),
-      on="customer_id",
-      how="left"
-  )
+    selected_columns = ["id", "customer_id", "name", "name_lower"] + [f"metadata_parsed.{field}" for field in metadata]
+    if facets:
+        selected_columns.append("metadata_parsed.facets")
 
-  final_df = final_df.withColumn("How_to_get_it", col("facets.`How to get it`")) \
-                   .withColumn("Primary_Brand", col("facets.`Primary Brand`")) \
-                   .withColumn("Primary_Color", col("facets.`Primary Color`")) \
-                   .withColumn("Killed_Item_flag", col("facets.`Killed Item flag`")) \
-                   .withColumn("Primary_Pet_Type", col("facets.`Primary Pet Type`")) \
-                   .withColumn("Personalized_Item_flag", col("facets.`Personalized Item flag`")) \
-                   .withColumn("Prescription_Medication", col("facets.`Prescription Medication`"))
+    return data_items_parsed.select(*selected_columns)
 
-  # Если исходный столбец facets больше не нужен, можно его удалить:
-  final_df = final_df.drop("facets")
 
-  return final_df
+def find_intersection(data_items: pyspark.sql.DataFrame, group_col: str, value_col: str) -> pyspark.sql.DataFrame:
+    """Находит пересечение значений в колонке value_col для каждой группы, определенной group_col.
 
-def create_sctructure_metadata():
-  metadata_schema = StructType([
-      StructField("url", StringType(), True),
-      StructField("image_url", StringType(), True),
-      StructField("facets", StructType([
-          StructField("How to get it", ArrayType(StringType()), True),
-          StructField("Primary Brand", ArrayType(StringType()), True),
-          StructField("Primary Color", ArrayType(StringType()), True),
-          StructField("Killed Item flag", ArrayType(StringType()), True),
-          StructField("Primary Pet Type", ArrayType(StringType()), True),
-          StructField("Personalized Item flag", ArrayType(StringType()), True),
-          StructField("Prescription Medication", ArrayType(StringType()), True)
-      ]), True),
-      StructField("group_ids", ArrayType(StringType()), True),
-      StructField("PTC_OMNI_REPEAT_DELIVERY_FL", StringType(), True),
-      StructField("parentCatEntryIDAsString", StringType(), True),
-      StructField("PTC_OMNI_PRIMARY_ITEM_FLAG", StringType(), True),
-      StructField("mfName", StringType(), True),
-      StructField("PTC_OMNI_IN_STORE_ONLY_FLAG", StringType(), True),
-      StructField("PTC_OMNI_PROP_65_FLAG", StringType(), True),
-      StructField("PTC_OMNI_TAXONOMY", StringType(), True),
-      StructField("PTC_OMNI_PERSONALIZED_ITEM_FL", StringType(), True),
-      StructField("parentCatEntryID", StringType(), True),
-      StructField("startDate", StringType(), True),
-      StructField("deactivated", BooleanType(), True),
-      StructField("PTC_OMNI_SAME_DAY_DELIVERY_FG", StringType(), True),
-      StructField("PTC_OMNI_PDP_BEHAVIOR_TEMPLATE", StringType(), True),
-      StructField("itemname", StringType(), True),
-      StructField("PTC_OMNI_BOPUS_FLAG", StringType(), True),
-      StructField("PTC_OMNI_BRAND_PRIMARY", StringType(), True),
-      StructField("itemurl", StringType(), True),
-      StructField("itemimg", StringType(), True),
-      StructField("UPC_NUMBER", StringType(), True)
-  ])
+    Args:
+        data_items (DataFrame): Входной датасет.
+        group_col (str): Название колонки, по которой будет группировка (например, customer_id).
+        value_col (str): Название колонки, для которой ищется пересечение значений. (например, group_ids)
 
-  return metadata_schema
+    Returns:
+        DataFrame: Датасет с group_col и пересечением значений из value_col.
+    """
+    exploded_df = data_items.select(group_col, F.explode(value_col).alias("value"))
 
-# Функция для вычисления пересечения списка списков
-def array_intersection(arrays):
-    if not arrays:
-        return []
-    # Инициализируем пересечение первым списком
-    result = set(arrays[0])
-    # Пересекаем с каждым следующим списком
-    for arr in arrays[1:]:
-        result = result.intersection(arr)
-    return list(result)
+    grouped_df = exploded_df.groupBy(group_col, "value").agg(F.count("*").alias("count"))
+    total_lists_per_group = data_items.groupBy(group_col).agg(F.count("*").alias("total_lists"))
 
-def items_to_sasrec_format(data_items_cleaned):
-  data_items_cleaned = data_items_cleaned.select('customer_id', 'group_ids_intersect', 'How_to_get_it', 'Primary_Brand', 'Primary_Pet_Type')
+    joined_df = grouped_df.join(total_lists_per_group, on=group_col, how="left")
 
-  # Разворачиваем списки и добавляем новые колонки с признаками
-  df_category = data_items_cleaned.select(
-      "customer_id",
-      F.explode("group_ids_intersect").alias("value")
-  ).withColumn("feature", F.lit("Category")).withColumnRenamed("customer_id", "id")
+    return joined_df.filter(F.col("count") == F.col("total_lists")) \
+        .groupBy(group_col) \
+        .agg(F.collect_list("value").alias(f"{value_col}_intersect"))
 
-  df_delivery = data_items_cleaned.select(
-      "customer_id",
-      F.explode("How_to_get_it").alias("value")
-  ).withColumn("feature", F.lit("Delivery")).withColumnRenamed("customer_id", "id")
 
-  df_brand = data_items_cleaned.select(
-      "customer_id",
-      F.explode("Primary_Brand").alias("value")
-  ).withColumn("feature", F.lit("Brand")).withColumnRenamed("customer_id", "id")
+def aggregate_data_items(data_items: pyspark.sql.DataFrame, metadata: List[str], facets: Optional[List[str]] = None) -> pyspark.sql.DataFrame:
+    """Агрегирует данные по customer_id, беря первые значения одинаковых колонок.
+       В тех колонках, где внутри одного customer_id значения не меняются, берем первые из этих значений для опредления признака данного customer_id
+    """
+    same_columns = ['name', 'name_lower'] + metadata
+    if facets:
+        same_columns.append("facets")
 
-  df_pet = data_items_cleaned.select(
-      "customer_id",
-      F.explode("Primary_Pet_Type").alias("value")
-  ).withColumn("feature", F.lit("Pet")).withColumnRenamed("customer_id", "id")
+    return data_items.groupBy("customer_id").agg(
+        *[F.first(col_name).alias(col_name) for col_name in same_columns if col_name != "customer_id"]
+    )
 
-  # Объединяем все эти датафреймы в один
-  data_items_processed = df_category.union(df_delivery).union(df_brand).union(df_pet)
-  data_items_processed = data_items_processed.toPandas().dropna()
-  data_items_processed['id'] = data_items_processed['id'].apply(lambda x: int(x))
 
-  return data_items_processed
+def clean_data_items(data_items: pyspark.sql.DataFrame, metadata: List[str], facets: Optional[List[str]] = None) -> pyspark.sql.DataFrame:
+    """Убирает лишние колонки, разворачивает нужные метаданные и facets в новые колонки, а также агрегирует признаки внутри одних customer_id
+
+        Args:
+        data_items (pyspark.sql.DataFrame): Исходный pyspark.sql.DataFrame (data_set_items) с товарами.
+        metadata (List[str]): Список названий колонок с метаданными, кроме facets, которые надо оставить и развернуть
+        facets (List[str]): Список имен facets, которые надо оставить и развернуть
+
+    Returns:
+        pyspark.sql.DataFrame: Преобразованный pyspark.sql.DataFrame."""
+
+    data_items_filtered = data_items.select("id", "customer_id", "name", "name_lower", "metadata_json")
+    data_items_parsed = parse_metadata_json(data_items_filtered, metadata, facets)
+
+    aggregated_same = aggregate_data_items(data_items_parsed, metadata, facets)
+
+    # Находим внутри каждого customer_id перечение group_ids
+    if "group_ids" in metadata:
+        intersected_df = find_intersection(data_items_parsed, "customer_id", "group_ids")
+        final_df = aggregated_same.join(intersected_df.select("customer_id", "group_ids_intersect"), on="customer_id", how="left")
+        final_df = final_df.drop("group_ids")
+    else:
+        final_df = aggregated_same
+
+    # Извлекаем отдельные атрибуты из facets, если facets передан, и вставляем их в датасет в качестве новых колонок
+    if facets:
+        for facet in facets:
+            final_df = final_df.withColumn(facet.replace(" ", "_"), F.col(f"facets.`{facet}`"))
+        final_df = final_df.drop("facets")
+
+    if 'Primary Pet Type' in facets:
+      final_df = final_df.withColumn('Primary_Pet_Type', F.split(F.col('Primary_Pet_Type')[0], ","))
+
+    # Проверяем датасет на пропущенные значения
+    # check_nan_values(data_items_processed)
+
+    return final_df
+
+def items_to_sasrec_format(
+    data_items_cleaned: pyspark.sql.DataFrame, # результат функции clean_data_items от изначального датасета data_set_items
+    features: List[str],
+    features_names_out: List[str]
+) -> pyspark.sql.DataFrame:
+    """Преобразует данные о товарах в формат SASRec.
+
+    Args:
+        data_items_cleaned (pyspark.sql.DataFrame): Исходный pyspark.sql.DataFrame с товарами.
+        features (List[str]): Список названий колонок с фичами.
+        features_names_out (List[str]): Список имен фичей для выхода.
+
+    Returns:
+        DataFrame: Преобразованный pyspark.sql.DataFrame с фичами в формате SASRec.
+    """
+    df = data_items_cleaned.select(*(['customer_id'] + features))
+    df = df.withColumn('customer_id', F.col('customer_id').cast('int'))
+    dfs_feature = []
+
+    for i in range(len(features)):
+        feature = df.select(
+            "customer_id",
+            F.explode(features[i]).alias("value")
+        ).withColumn("feature", F.lit(features_names_out[i])).withColumnRenamed("customer_id", "id")
+        dfs_feature.append(feature)
+
+    data_items_processed = dfs_feature[0]
+    for i in range(1, len(features)):
+        data_items_processed = data_items_processed.union(dfs_feature[i])
+
+    # Проверяем датасет на пропущенные значения
+    # check_nan_values(data_items_processed)
+
+    return data_items_processed.orderBy('id', 'feature', 'value')
+
+"""# Прочие функции
+
+"""
+
+def save_dataset_parquet(dataset: pyspark.sql.DataFrame, folder_path: str, file_name: str) -> None:
+    """
+    Сохраняет датасет в формате Parquet по указанному пути.
+
+    Args:
+        dataset (pyspark.sql.DataFrame): Датасет, который нужно сохранить.
+        folder_path (str): Путь к папке, куда будет сохранён файл.
+        file_name (str): Имя файла для сохранения (без расширения).
+
+    Returns:
+        None: Функция не возвращает значение, но сохраняет датасет на диск.
+    """
+    # Проверяем, существует ли папка, если нет - создаем
+    if not os.path.exists(folder_path):
+        os.makedirs(folder_path)
+        print(f"Папка {folder_path} успешно создана!")
+    else:
+        print(f"Папка {folder_path} уже существует.")
+
+    # Формируем полный путь к файлу
+    file_path = os.path.join(folder_path, file_name)
+
+    # Сохранение в формате Parquet
+    dataset.write.parquet(file_path, mode="overwrite")
+    print(f"Датасет сохранён по пути {file_path}.")
+

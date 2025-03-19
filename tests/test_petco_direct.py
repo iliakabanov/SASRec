@@ -142,7 +142,7 @@ def create_raw_items_dataset(customer_ids: List[int]):
 def create_expected_actions_dataset(customer_ids: List[int]):
   '''
   Params:
-      conversions (List[List]): Строки сырого игрушечного датасета товаров
+      customer_ids (List[int]): Список id товаров для игрушечного примера
 
   Returns:
       pyspark.sql.DataFrame: Ожидаемый вид датасета с действиями юзеров в формате SASRec
@@ -218,11 +218,10 @@ def create_expected_items_dataset(customer_ids: List[int]):
 
   return df.orderBy('id', 'feature', 'value')
 
+
 """# Тест для датасета с признаками товаров в формате SASRec"""
 
 # creating SparkSession
-from pyspark.sql import SparkSession
-
 spark = SparkSession.builder.appName('Petco_Direct_Tests').getOrCreate()
 
 # Создаем игрушечный пример сырого датасета с признаками трех товаров
@@ -243,6 +242,7 @@ def test_items_sasrec(data_items_raw : pyspark.sql.DataFrame,
   data_items_processed = process_data.items_to_sasrec_format(data_items_cleaned, features, features_final_names)
 
   assert_df_equality(data_items_processed, data_items_expected, ignore_nullable=True)
+
 
 """# Тест для датасета с признакми товаров в формате SASRec"""
 

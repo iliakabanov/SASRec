@@ -156,7 +156,7 @@ def create_expected_actions_dataset(customer_ids: List[int]):
   ])
 
   # Создаем тестовые данные с обновленным metadata_json
-  raw_data = [
+  expected_output = [
       (11111111111, customer_ids[0], datetime(2024, 9, 4, 20, 45, 1), 1),
       (11111111111, customer_ids[1], datetime(2024, 9, 4, 20, 50, 1), 1),
       (11111111111, customer_ids[0], datetime(2024, 9, 4, 21, 00, 1), 1),
@@ -257,5 +257,6 @@ def test_actions_sasrec(data_actions_raw : pyspark.sql.DataFrame,  data_actions_
   data_actions_processed = process_data.actions_to_sasrec_format(data_actions_cleaned)
 
   assert_df_equality(data_actions_processed, data_actions_expected, ignore_nullable=True)
+
 
 
